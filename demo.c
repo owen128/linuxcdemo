@@ -15,11 +15,15 @@
 #include <linux/sched/stat.h>
 #include <linux/mm.h>
 #include <linux/math64.h>
+#include <linux/interrupt.h>  //V1.01新增部份：用於中斷處理
+#include <linux/vmalloc.h>    //V1.01新增部份：用於vmalloc
+#include <linux/workqueue.h>  //V1.01新增部份：用於工作隊列
 
 #define DEVICE_NAME "sysmonitor"
 #define CLASS_NAME "sysmon"
 #define BUF_LEN 100
 #define SUCCESS 0
+#define PROC_NAME "sysmonitor_info"  // 新增：定義proc文件名
 
 static int major_number; //這個變量用於存儲設備的主設備號。在Linux設備驅動模型中，每個設備都有一個主設備號和次設備號。主設備號是識別設備驅動程序的關鍵。它允許內核將設備文件操作映射到正確的驅動程序函數。
 static struct class* sysmonitor_class = NULL;
@@ -28,6 +32,10 @@ static struct timer_list update_timer;
 
 static int Device_Open = 0;
 static char kernel_buffer[BUF_LEN];
+
+//V1.01新增部份
+static void *large_buffer;  // 新增：用於演示vmalloc的使用
+static struct work_struct update_work;  // 新增：用於演示工作隊列的使用
 
 /* 與update_sysinfo和sysmonitor_proc_show配合 */
 struct sysinfo_data {
@@ -221,6 +229,20 @@ static void update_sysinfo(struct timer_list *t)
     mod_timer(&update_timer, jiffies + msecs_to_jiffies(1000));
 }
 
+//V1.01新增部份：中斷處理函數
+static irqreturn_t sysmonitor_interrupt(int irq, void *dev_id)
+{
+    pr_debug("SysMonitor: Interrupt received\n");
+    return IRQ_HANDLED;
+}
+
+//V1.01新增部份：工作隊列處理函數
+static void update_work_func(struct work_struct *work)
+{
+    pr_debug("SysMonitor: Performing delayed work\n");
+    // 在這裡執行耗時的操作
+}
+
 static int __init sysmonitor_init(void)
 {
     /*
@@ -235,34 +257,47 @@ static int __init sysmonitor_init(void)
     // 分配主設備號
     if ((major_number = register_chrdev(0, DEVICE_NAME, &sysmonitor_fops)) < 0) {
         printk(KERN_ALERT "SysMonitor failed to register a major number\n");
-        return major_number;
+        ret = major_number;
+        goto fail_chrdev;
     }
 
     // 註冊設備類
     sysmonitor_class = class_create(THIS_MODULE, CLASS_NAME);
     if (IS_ERR(sysmonitor_class)) {
-        unregister_chrdev(major_number, DEVICE_NAME);
         printk(KERN_ALERT "Failed to register device class\n");
-        return PTR_ERR(sysmonitor_class);
+        ret = sysmonitor_class;
+        goto fail_class;
     }
 
     // 註冊設備驅動
     sysmonitor_device = device_create(sysmonitor_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
     if (IS_ERR(sysmonitor_device)) {
-        class_destroy(sysmonitor_class);
-        unregister_chrdev(major_number, DEVICE_NAME);
         printk(KERN_ALERT "Failed to create the device\n");
-        return PTR_ERR(sysmonitor_device);
+        ret = sysmonitor_device;
+        goto fail_device;
     }
 
     // 創建proc入口
     proc_sysmonitor = proc_create(PROC_NAME, 0, NULL, &sysmonitor_proc_fops);
     if (!proc_sysmonitor) {
-        device_destroy(sysmonitor_class, MKDEV(major_number, 0));
-        class_destroy(sysmonitor_class);
-        unregister_chrdev(major_number, DEVICE_NAME);
         printk(KERN_ALERT "Failed to create proc entry\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto fail_proc;
+    }
+
+    ///V1.01新增部份：分配大塊內存
+    large_buffer = vmalloc(1024 * 1024);  // 分配1MB內存
+    if (!large_buffer) {
+        printk(KERN_ALERT "SysMonitor: Failed to allocate large buffer\n");
+        ret = -ENOMEM;
+        goto fail_vmalloc;
+    }
+
+    //V1.01新增部份：註冊中斷處理程序（示例使用IRQ 1，實際使用時應該使用正確的IRQ號）
+    ret = request_irq(1, sysmonitor_interrupt, IRQF_SHARED, "sysmonitor", THIS_MODULE);
+    if (ret) {
+        printk(KERN_ALERT "SysMonitor: Failed to request IRQ\n");
+        goto fail_irq;
     }
 
     // 初始化定時器
@@ -274,8 +309,26 @@ static int __init sysmonitor_init(void)
     
     mod_timer(&update_timer, jiffies + msecs_to_jiffies(1000));
 
+    //V1.01新增部份：初始化工作隊列
+    INIT_WORK(&update_work, update_work_func);
+
     printk(KERN_INFO "SysMonitor: module loaded\n");
     return 0;
+
+    /*V1.01新增部份*/
+    fail_irq:
+        free_irq(1, THIS_MODULE);
+    fail_vmalloc:
+        vfree(large_buffer);
+    fail_proc:
+        proc_remove(proc_sysmonitor);
+    fail_device:
+        device_destroy(sysmonitor_class, MKDEV(major_number, 0));
+    fail_class:
+        class_destroy(sysmonitor_class);
+    fail_chrdev:
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return ret;
 }
 
 static void __exit sysmonitor_exit(void)
@@ -295,6 +348,15 @@ static void __exit sysmonitor_exit(void)
     class_unregister(sysmonitor_class);
     class_destroy(sysmonitor_class);
     unregister_chrdev(major_number, DEVICE_NAME);
+
+    /*V1.01新增部份*/
+    // 新增：釋放中斷
+    free_irq(1, THIS_MODULE);
+    // 新增：釋放大塊內存
+    vfree(large_buffer);
+    // 新增：取消掉所有未完成的工作
+    cancel_work_sync(&update_work);
+
     printk(KERN_INFO "SysMonitor: module unloaded\n");
 }
 
@@ -304,4 +366,4 @@ module_exit(sysmonitor_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Owen");
 MODULE_DESCRIPTION("System Monitor and Control Driver");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.01");
