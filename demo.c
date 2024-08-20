@@ -24,10 +24,12 @@
 #define BUF_LEN 100
 #define SUCCESS 0
 #define PROC_NAME "sysmonitor_info"  // 新增：定義proc文件名
+#define CUSTOM_IRQ 42  // 新增1.02： 使用一個不太可能被系統使用的軟中斷號
 
 static int major_number; //這個變量用於存儲設備的主設備號。在Linux設備驅動模型中，每個設備都有一個主設備號和次設備號。主設備號是識別設備驅動程序的關鍵。它允許內核將設備文件操作映射到正確的驅動程序函數。
 static struct class* sysmonitor_class = NULL;
 static struct timer_list update_timer;
+static struct tasklet_struct irq_tasklet; // 新增1.02
 
 
 static int Device_Open = 0;
@@ -36,6 +38,8 @@ static char kernel_buffer[BUF_LEN];
 //V1.01新增部份
 static void *large_buffer;  // 新增：用於演示vmalloc的使用
 static struct work_struct update_work;  // 新增：用於演示工作隊列的使用
+static struct device* sysmonitor_device = NULL; //V1.02新增部份
+static struct proc_dir_entry *proc_sysmonitor = NULL; //V1.02新增部份
 
 /* 與update_sysinfo和sysmonitor_proc_show配合 */
 struct sysinfo_data {
@@ -229,10 +233,18 @@ static void update_sysinfo(struct timer_list *t)
     mod_timer(&update_timer, jiffies + msecs_to_jiffies(1000));
 }
 
+// 新增1.02
+static void irq_tasklet_func(unsigned long data)
+{
+    printk(KERN_INFO "SysMonitor: Tasklet function called\n");
+    // 這裡可以執行中斷相關的操作
+}
+
 //V1.01新增部份：中斷處理函數
 static irqreturn_t sysmonitor_interrupt(int irq, void *dev_id)
 {
     pr_debug("SysMonitor: Interrupt received\n");
+    tasklet_schedule(&irq_tasklet);
     return IRQ_HANDLED;
 }
 
@@ -254,6 +266,7 @@ static int __init sysmonitor_init(void)
      * 5. 創建 proc 入口
      * 6. 初始化並啟動定時器
      */
+    int ret;
     // 分配主設備號
     if ((major_number = register_chrdev(0, DEVICE_NAME, &sysmonitor_fops)) < 0) {
         printk(KERN_ALERT "SysMonitor failed to register a major number\n");
@@ -265,7 +278,7 @@ static int __init sysmonitor_init(void)
     sysmonitor_class = class_create(THIS_MODULE, CLASS_NAME);
     if (IS_ERR(sysmonitor_class)) {
         printk(KERN_ALERT "Failed to register device class\n");
-        ret = sysmonitor_class;
+        ret = PTR_ERR(sysmonitor_class);
         goto fail_class;
     }
 
@@ -273,7 +286,7 @@ static int __init sysmonitor_init(void)
     sysmonitor_device = device_create(sysmonitor_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
     if (IS_ERR(sysmonitor_device)) {
         printk(KERN_ALERT "Failed to create the device\n");
-        ret = sysmonitor_device;
+        ret = PTR_ERR(sysmonitor_device);
         goto fail_device;
     }
 
@@ -293,13 +306,15 @@ static int __init sysmonitor_init(void)
         goto fail_vmalloc;
     }
 
+    //1.02新增
+    tasklet_init(&irq_tasklet, irq_tasklet_func, 0);
+
     //V1.01新增部份：註冊中斷處理程序（示例使用IRQ 1，實際使用時應該使用正確的IRQ號）
     ret = request_irq(1, sysmonitor_interrupt, IRQF_SHARED, "sysmonitor", THIS_MODULE);
     if (ret) {
         printk(KERN_ALERT "SysMonitor: Failed to request IRQ\n");
         goto fail_irq;
     }
-
     // 初始化定時器
     // 在較新的內核版本中（4.15+）
     timer_setup(&update_timer, update_sysinfo, 0);
@@ -350,8 +365,9 @@ static void __exit sysmonitor_exit(void)
     unregister_chrdev(major_number, DEVICE_NAME);
 
     /*V1.01新增部份*/
-    // 新增：釋放中斷
-    free_irq(1, THIS_MODULE);
+    // 新增1.02：釋放中斷
+    free_irq(CUSTOM_IRQ, THIS_MODULE);
+    tasklet_kill(&irq_tasklet);
     // 新增：釋放大塊內存
     vfree(large_buffer);
     // 新增：取消掉所有未完成的工作
