@@ -18,6 +18,7 @@
 #include <linux/interrupt.h>  //V1.01新增部份：用於中斷處理
 #include <linux/vmalloc.h>    //V1.01新增部份：用於vmalloc
 #include <linux/workqueue.h>  //V1.01新增部份：用於工作隊列
+#include <linux/string.h>
 
 #define DEVICE_NAME "sysmonitor"
 #define CLASS_NAME "sysmon"
@@ -41,6 +42,8 @@ static struct work_struct update_work;  // 新增：用於演示工作隊列的�
 static struct device* sysmonitor_device = NULL; //V1.02新增部份
 static struct proc_dir_entry *proc_sysmonitor = NULL; //V1.02新增部份
 
+static unsigned long long last_idle = 0, last_total = 0; //V1.03新增部份
+
 /* 與update_sysinfo和sysmonitor_proc_show配合 */
 struct sysinfo_data {
     unsigned long mem_total;
@@ -53,14 +56,14 @@ static struct sysinfo_data current_info;
 
 static int count_running_processes(void)
 {
-    struct task_struct *task; //是Linux內核中表示進程的結構體
-    static int count = 0;
+    struct task_struct *task;
+    int count = 0;
 
     rcu_read_lock();  //RCU是Linux內核中用於同步的一種機制，可以在不阻塞讀操作的情況下進行更新
     /*在遍歷過程中，進程列表可能被修改（新進程創建、舊進程終止）。
     沒有 RCU，可能會訪問到已經被釋放的內存，導致系統崩潰。*/
     for_each_process(task) {
-        if (task->state == TASK_RUNNING) //TASK_RUNNING Linux 內核源碼中定義的一個常量 表示進程正在運行或準備運行
+        if (task_is_running(task))
             count++;
     }
     rcu_read_unlock();
@@ -70,29 +73,38 @@ static int count_running_processes(void)
 
 static int get_cpu_usage(void)
 {
-    static int usage;
-    unsigned long long idle_time, total_time;
-    struct kernel_cpustat *kcpustat;
-    
-    // 獲取在線CPU的數量
-    get_online_cpus();
-    kcpustat = &kcpustat_cpu(0); // 獲取第一個CPU（CPU 0）的統計信息
-    idle_time = kcpustat->cpustat[CPUTIME_IDLE]; // 獲取空閒時間
-    // 計算總時間（所有CPU狀態的時間總和）
-    total_time = idle_time + kcpustat->cpustat[CPUTIME_USER] +
-                 kcpustat->cpustat[CPUTIME_NICE] +
-                 kcpustat->cpustat[CPUTIME_SYSTEM] +
-                 kcpustat->cpustat[CPUTIME_IRQ] +
-                 kcpustat->cpustat[CPUTIME_SOFTIRQ] +
-                 kcpustat->cpustat[CPUTIME_STEAL];
-    put_online_cpus(); // 釋放在線CPU的引用計數
+    struct file *file;
+    char buf[256];
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+    unsigned long long total, idle_time, usage = 0;
+    int ret;
 
-    if (total_time > idle_time)
-        usage = div64_ul(100 * (total_time - idle_time), total_time); // 使用率 = (總時間 - 空閒時間) / 總時間 * 100
-    else
-        usage = 0;
+    file = filp_open("/proc/stat", O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        printk(KERN_ERR "SysMonitor: Failed to open /proc/stat\n");
+        return 0;
+    }
 
-    return usage;
+    ret = kernel_read(file, buf, sizeof(buf), &file->f_pos);
+    if (ret > 0) {
+        sscanf(buf, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+               &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+
+        idle_time = idle + iowait;
+        total = user + nice + system + idle + iowait + irq + softirq + steal;
+
+        if (last_total != 0 && last_idle != 0 && total > last_total && idle_time > last_idle) {
+            unsigned long long total_delta = total - last_total;
+            unsigned long long idle_delta = idle_time - last_idle;
+            usage = 100 - div64_u64(100 * idle_delta, total_delta);
+        }
+
+        last_total = total;
+        last_idle = idle_time;
+    }
+
+    filp_close(file, NULL);
+    return (int)usage;
 }
 
 static int sysmonitor_open(struct inode *inode, struct file *file)
@@ -103,7 +115,6 @@ static int sysmonitor_open(struct inode *inode, struct file *file)
      * 2. 初始化任何必要的資源
      * 3. 返回成功或錯誤代碼
      */
-    static int counter = 0;
 
     if (Device_Open)
         return -EBUSY;
@@ -194,6 +205,8 @@ static int sysmonitor_proc_show(struct seq_file *m, void *v)
      * 1. 收集系統信息（CPU 使用率、內存使用情況等）
      * 2. 使用 seq_printf 將信息寫入 seq_file
      */
+    printk(KERN_DEBUG "SysMonitor: Proc show called\n");
+
     seq_printf(m, "系統信息:\n");
     seq_printf(m, "總內存: %lu MB\n", current_info.mem_total);
     seq_printf(m, "可用內存: %lu MB\n", current_info.mem_free);
@@ -222,13 +235,27 @@ static void update_sysinfo(struct timer_list *t)
      * 1. 收集並更新系統信息
      * 2. 重新設置定時器
      */
+    printk(KERN_DEBUG "SysMonitor: Updating system info\n");
+
     struct sysinfo si;
+    int cpu_usage;
+
     si_meminfo(&si);
 
     current_info.mem_total = si.totalram * si.mem_unit / (1024 * 1024);
     current_info.mem_free = si.freeram * si.mem_unit / (1024 * 1024);
-    current_info.cpu_usage = get_cpu_usage();
+    
+    cpu_usage = get_cpu_usage();
+    if (cpu_usage < 0) {
+        printk(KERN_ERR "SysMonitor: Failed to get CPU usage\n");
+        cpu_usage = 0;  // 使用默認值
+    }
+    current_info.cpu_usage = cpu_usage;
+
     current_info.running_processes = count_running_processes();
+
+    printk(KERN_DEBUG "SysMonitor: Updated - Total RAM: %lu MB, Free RAM: %lu MB, CPU Usage: %d%%, Running Processes: %d\n",
+           current_info.mem_total, current_info.mem_free, current_info.cpu_usage, current_info.running_processes);
 
     mod_timer(&update_timer, jiffies + msecs_to_jiffies(1000));
 }
@@ -275,7 +302,7 @@ static int __init sysmonitor_init(void)
     }
 
     // 註冊設備類
-    sysmonitor_class = class_create(THIS_MODULE, CLASS_NAME);
+    sysmonitor_class = class_create(CLASS_NAME);
     if (IS_ERR(sysmonitor_class)) {
         printk(KERN_ALERT "Failed to register device class\n");
         ret = PTR_ERR(sysmonitor_class);
@@ -382,4 +409,4 @@ module_exit(sysmonitor_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Owen");
 MODULE_DESCRIPTION("System Monitor and Control Driver");
-MODULE_VERSION("1.02");
+MODULE_VERSION("1.03");
