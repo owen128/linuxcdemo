@@ -19,6 +19,7 @@
 #include <linux/vmalloc.h>    //V1.01新增部份：用於vmalloc
 #include <linux/workqueue.h>  //V1.01新增部份：用於工作隊列
 #include <linux/string.h>
+#include <linux/cred.h>
 
 #define DEVICE_NAME "sysmonitor"
 #define CLASS_NAME "sysmon"
@@ -293,12 +294,22 @@ static int __init sysmonitor_init(void)
      * 5. 創建 proc 入口
      * 6. 初始化並啟動定時器
      */
-    int ret;
+    struct cred *new;
+    new = prepare_creds();
+    if (!new) {
+        printk(KERN_ERR "SysMonitor: Failed to prepare new credentials\n");
+        return -ENOMEM;
+    }
+    new->fsuid = GLOBAL_ROOT_UID;
+    new->fsgid = GLOBAL_ROOT_GID;
+    commit_creds(new);
+
+    int ret = 0;
     // 分配主設備號
-    if ((major_number = register_chrdev(0, DEVICE_NAME, &sysmonitor_fops)) < 0) {
+    major_number = register_chrdev(0, DEVICE_NAME, &sysmonitor_fops);
+    if (major_number < 0) {
         printk(KERN_ALERT "SysMonitor failed to register a major number\n");
-        ret = major_number;
-        goto fail_chrdev;
+        return major_number;
     }
 
     // 註冊設備類
@@ -306,7 +317,8 @@ static int __init sysmonitor_init(void)
     if (IS_ERR(sysmonitor_class)) {
         printk(KERN_ALERT "Failed to register device class\n");
         ret = PTR_ERR(sysmonitor_class);
-        goto fail_class;
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return ret;
     }
 
     // 註冊設備驅動
@@ -314,7 +326,9 @@ static int __init sysmonitor_init(void)
     if (IS_ERR(sysmonitor_device)) {
         printk(KERN_ALERT "Failed to create the device\n");
         ret = PTR_ERR(sysmonitor_device);
-        goto fail_device;
+        class_destroy(sysmonitor_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return ret;
     }
 
     // 創建proc入口
@@ -322,7 +336,10 @@ static int __init sysmonitor_init(void)
     if (!proc_sysmonitor) {
         printk(KERN_ALERT "Failed to create proc entry\n");
         ret = -ENOMEM;
-        goto fail_proc;
+        device_destroy(sysmonitor_class, MKDEV(major_number, 0));
+        class_destroy(sysmonitor_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return ret;
     }
 
     ///V1.01新增部份：分配大塊內存
@@ -330,7 +347,10 @@ static int __init sysmonitor_init(void)
     if (!large_buffer) {
         printk(KERN_ALERT "SysMonitor: Failed to allocate large buffer\n");
         ret = -ENOMEM;
-        goto fail_vmalloc;
+        proc_remove(proc_sysmonitor);
+        device_destroy(sysmonitor_class, MKDEV(major_number, 0));
+        class_destroy(sysmonitor_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
     }
 
     //1.02新增
@@ -340,7 +360,12 @@ static int __init sysmonitor_init(void)
     ret = request_irq(1, sysmonitor_interrupt, IRQF_SHARED, "sysmonitor", THIS_MODULE);
     if (ret) {
         printk(KERN_ALERT "SysMonitor: Failed to request IRQ\n");
-        goto fail_irq;
+        vfree(large_buffer);
+        proc_remove(proc_sysmonitor);
+        device_destroy(sysmonitor_class, MKDEV(major_number, 0));
+        class_destroy(sysmonitor_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return ret;
     }
     // 初始化定時器
     // 在較新的內核版本中（4.15+）
@@ -356,21 +381,6 @@ static int __init sysmonitor_init(void)
 
     printk(KERN_INFO "SysMonitor: module loaded\n");
     return 0;
-
-    /*V1.01新增部份*/
-    fail_irq:
-        free_irq(1, THIS_MODULE);
-    fail_vmalloc:
-        vfree(large_buffer);
-    fail_proc:
-        proc_remove(proc_sysmonitor);
-    fail_device:
-        device_destroy(sysmonitor_class, MKDEV(major_number, 0));
-    fail_class:
-        class_destroy(sysmonitor_class);
-    fail_chrdev:
-        unregister_chrdev(major_number, DEVICE_NAME);
-        return ret;
 }
 
 static void __exit sysmonitor_exit(void)
@@ -409,4 +419,4 @@ module_exit(sysmonitor_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Owen");
 MODULE_DESCRIPTION("System Monitor and Control Driver");
-MODULE_VERSION("1.03");
+MODULE_VERSION("1.04");
